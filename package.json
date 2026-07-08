@@ -1,7 +1,7 @@
 {
   "name": "todo-app",
   "version": "1.0.0",
-  "description": "Task management app",
+  "description": "TODO app with PostgreSQL",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
