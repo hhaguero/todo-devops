@@ -1,8 +1,7 @@
-```markdown
 # TODO App — DevOps Portfolio Project
 
-**Status**: 🚀 Proyecto 3 (Monitoreo) completado
-**Last updated**: Julio 30, 2026
+**Status**: ✅ Proyecto 4 (Node Exporter) completado
+**Last updated**: Agosto 3, 2026
 
 ---
 
@@ -346,7 +345,7 @@ Umbral alerta: > 1000ms = app lenta
 
 #### Panel 3: Error Rate
 ```
-Métrica: rate(http_requests_total{status_code=~"5.."}[1m]) / rate(http_requests_total[1m]) * 100
+Métrica: rate(http_requests_total{status_code="500"}[1m]) / rate(http_requests_total[1m]) * 100
 Muestra: % de errores 5xx
 Ejemplo: 5% = de cada 100 requests, 5 fallan
 Umbral alerta: > 5% = algo está mal
@@ -537,15 +536,358 @@ docker start 7448e84e8912
 - Receiver: Dónde notificar (Slack, email, etc.)
 - Deduplication: AlertManager agrupa alertas similares
 
+---
+
+## Proyecto 4: Node Exporter (Métricas del Servidor)
+
+**Fecha**: Agosto 3, 2026
+**Status**: ✅ Completado
+
+### Objetivo
+
+Monitorear el **servidor EC2** en sí (CPU, RAM, Disco, Red), no solo la app.
+
+**Problema resuelto:** En P3 tuvimos OOM kills porque no sabíamos cuánta RAM quedaba libre.
+
+### Stack
+
+- **Node Exporter**: v1.8.0 (agente que expone métricas del SO)
+- **Prometheus**: Scratchea node en puerto 9100
+- **Grafana**: Dashboard "System Metrics" con 4 paneles
+- **Alertas**: HighCPU, HighMemory, LowDisk → Slack
+
+### Arquitectura
+
+```
+EC2 Ubuntu
+├── App (Node.js) → /metrics → http_requests_total, latency
+├── Node Exporter → /metrics → node_cpu_seconds_total, node_memory_*
+└── PostgreSQL
+
+        ↓
+
+Prometheus (scratchea ambos cada 15s)
+
+        ↓
+
+Grafana (2 dashboards)
+├── App Metrics (Request Rate, Latency, Error Rate)
+└── System Metrics (CPU, Memory, Disk, Network)
+
+        ↓
+
+AlertManager
+
+        ↓
+
+Slack #alerts
+```
+
+### Instalación
+
+#### 1. Descargar Node Exporter
+```bash
+cd /opt
+sudo wget https://github.com/prometheus/node_exporter/releases/download/v1.8.0/node_exporter-1.8.0.linux-amd64.tar.gz
+sudo tar xzf node_exporter-1.8.0.linux-amd64.tar.gz
+sudo mv node_exporter-1.8.0.linux-amd64 node_exporter
+sudo chown -R ubuntu:ubuntu /opt/node_exporter
+```
+
+#### 2. Crear systemd service
+```bash
+sudo nano /etc/systemd/system/node_exporter.service
+```
+
+```ini
+[Unit]
+Description=Prometheus Node Exporter
+Documentation=https://github.com/prometheus/node_exporter
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/opt/node_exporter/node_exporter
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable node_exporter
+sudo systemctl start node_exporter
+```
+
+#### 3. Verificar
+```bash
+curl http://localhost:9100/metrics | head -20
+# Debería mostrar: node_cpu_seconds_total, node_memory_*, etc.
+```
+
+### Configuración Prometheus
+
+Editar `prometheus.yml`:
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - localhost:9093
+
+scrape_configs:
+  - job_name: "todo-app"
+    static_configs:
+      - targets: ["localhost:80"]
+    metrics_path: "/metrics"
+
+  - job_name: "node"
+    static_configs:
+      - targets: ["localhost:9100"]
+
+rule_files:
+  - alerts.yml
+```
+
+Reiniciar:
+```bash
+sudo systemctl restart prometheus
+curl http://localhost:9090/api/v1/targets
+# Ambos jobs deben estar "up"
+```
+
+### Dashboards en Grafana
+
+#### Dashboard 1: System Metrics
+
+**Panel 1: CPU Usage**
+```
+Query: (1 - avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) * 100
+Unit: Percent (0-100)
+Threshold: 50% (rojo - t3.micro limitado)
+```
+
+**Panel 2: Memory Usage**
+```
+Query: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+Unit: Percent (0-100)
+Threshold: 80% (rojo)
+```
+
+**Panel 3: Disk Usage /**
+```
+Query: (1 - (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})) * 100
+Unit: Percent (0-100)
+Threshold: 80% (rojo)
+```
+
+**Panel 4: Network Bytes/sec**
+```
+Query: rate(node_network_transmit_bytes_total[1m])
+Unit: Data/rate Byte/Sec (SI)
+Legend: {{ device }}
+```
+
+#### Dashboard 2: App Metrics (actualizado)
+
+| Panel | Query | Unit |
+|-------|-------|------|
+| Request Rate | `rate(http_requests_total[1m])` | Reqps |
+| Latency p95 | `histogram_quantile(0.95, rate(http_request_duration_ms_bucket[5m]))` | ms |
+| Error Rate | `rate(http_requests_total{status_code="500"}[1m]) / rate(http_requests_total[1m]) * 100` | Percent |
+
+### Alertas Agregadas
+
+```yaml
+  - alert: HighCPU
+    expr: (100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]) * 100))) > 50
+    for: 2m
+    annotations:
+      summary: "⚠️ CPU > 50% en {{ $labels.instance }}"
+      description: "CPU usage: {{ $value | humanizePercentage }}"
+
+  - alert: HighMemory
+    expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.8
+    for: 2m
+    annotations:
+      summary: "⚠️ Memoria > 80% en {{ $labels.instance }}"
+      description: "RAM disponible: {{ $value | humanizePercentage }}"
+
+  - alert: LowDisk
+    expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.2
+    for: 2m
+    annotations:
+      summary: "⚠️ Disco < 20% disponible en {{ $labels.instance }}"
+      description: "Espacio: {{ $value | humanizePercentage }}"
+
+  - alert: HighLatencyNoBugs
+    expr: histogram_quantile(0.95, rate(http_request_duration_ms_bucket[5m])) > 1000 and rate(http_requests_total{status_code="500"}[5m]) == 0
+    for: 2m
+    annotations:
+      summary: "⚠️ Latencia alta sin errores (BD?)"
+      description: "Latency: {{ $value }}ms, Error Rate: 0%"
+```
+
+**Explicación:**
+- `HighCPU/HighMemory/LowDisk`: Métricas del servidor
+- `HighLatencyNoBugs`: Detección indirecta de problemas de BD
+
+### Cambios en la App
+
+Agregamos `prom-client` para exponer `/metrics`:
+
+**package.json:**
+```json
+{
+  "name": "todo-app",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "prom-client": "^15.0.0"
+  }
+}
+```
+
+**server.js:**
+```javascript
+const express = require('express');
+const client = require('prom-client');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Registrar métricas
+const register = new client.Registry();
+client.collectDefaultMetrics({ register });
+
+const httpRequestDuration = new client.Histogram({
+  name: 'http_request_duration_ms',
+  help: 'Duration of HTTP requests in ms',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.1, 5, 15, 50, 100, 500, 1000, 2500, 5000],
+  registers: [register]
+});
+
+const httpRequestTotal = new client.Counter({
+  name: 'http_requests_total',
+  help: 'Total HTTP requests',
+  labelNames: ['method', 'route', 'status_code'],
+  registers: [register]
+});
+
+// Middleware para medir latencia
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    httpRequestDuration.labels(req.method, req.path, res.statusCode).observe(duration);
+    httpRequestTotal.labels(req.method, req.path, res.statusCode).inc();
+  });
+  next();
+});
+
+app.use(express.json());
+
+// Endpoint de métricas
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
+
+app.get('/', (req, res) => {
+  res.json({ message: 'TODO App API running' });
+});
+
+app.get('/api/tasks', (req, res) => {
+  res.json({ tasks: [{ id: 1, title: 'Sample task', completed: false }] });
+});
+
+app.post('/api/tasks', (req, res) => {
+  res.json({ id: 2, title: req.body.title, completed: false });
+});
+
+app.get('/error', (req, res) => {
+  res.status(500).json({ error: 'Test error' });
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
+});
+```
+
+### Acceso
+
+| Componente | URL |
+|-----------|-----|
+| Node Exporter | http://18.189.29.49:9100/metrics |
+| App Metrics Dashboard | http://18.189.29.49:3000 (admin/admin) |
+| System Metrics Dashboard | http://18.189.29.49:3000 (admin/admin) |
+
+### Comandos
+
+```bash
+# Verificar Node Exporter
+curl http://localhost:9100/metrics | grep node_cpu
+
+# Verificar Prometheus scratchea
+curl http://localhost:9090/api/v1/targets
+
+# Verificar app expone /metrics
+curl http://localhost/metrics | grep http_requests_total
+
+# Ver alertas
+curl http://localhost:9090/api/v1/alerts
+
+# Generar carga para testear
+stress-ng --cpu 4 --timeout 120s
+```
+
+### Conceptos
+
+**Pull vs Push**
+- **Pull** (Prometheus): Prometheus pregunta "¿qué métricas tienes?"
+- **Push** (alternativa): App dice "aquí están mis métricas"
+- Ventaja Pull: Prometheus controla scraping, fácil escalar
+
+**Node Exporter**
+- Agente pequeño (~15MB) que lee SO
+- Exporta: CPU, RAM, Disco, Red, Procesos, Uptime
+- Compatible con Prometheus
+- Se usa en 90% de deployments Prometheus
+
+**Thresholds en P4**
+- P3 (App): > 1000ms latency, > 5% error rate
+- P4 (Server): > 50% CPU, > 80% RAM, < 20% disco (t3.micro es limitado)
+
+### Problemas Aprendidos
+
+| Problema | Causa | Solución |
+|----------|-------|----------|
+| OOM kills en P3 | t3.micro sin visibilidad de RAM | Node Exporter → ver RAM en Grafana |
+| Threshold 80% no dispara | t3.micro burstable limitado | Bajar a 50% |
+| `/metrics` no funciona | app no tiene prom-client | Agregar librería + código |
+| Regex `status_code=~"5.."` vacío | Prometheus regex confuso | Usar `status_code="500"` específico |
+| Error Rate sin datos | No había errores 500 | Crear endpoint `/error` para test |
+
 ### Próximos Pasos
 
-- [ ] Node Exporter (métricas del servidor: CPU, RAM, Disk)
 - [ ] cAdvisor (métricas por contenedor Docker)
-- [ ] Más alertas (CPU > 80%, Memoria > 80%, Disk > 80%)
-- [ ] Exportar dashboards a JSON (guardar en Git)
-- [ ] Migrar a Docker Compose (Prometheus, Grafana, AlertManager, App)
-- [ ] Notificaciones por email (alternativa a Slack)
-- [ ] Configurar PagerDuty (para escaladas en on-call)
+- [ ] Alertas de Network saturation
+- [ ] Custom metrics (business-level: auth attempts, etc.)
+- [ ] Migraciones a VictoriaMetrics (escala)
+- [ ] Long-term storage (compresión)
 
 ---
 
@@ -585,7 +927,8 @@ AWS Production (EC2 t3.micro)
 │   ├── Todo App (Node.js) - puerto 80
 │   ├── Prometheus - puerto 9090
 │   ├── Grafana - puerto 3000
-│   └── AlertManager - puerto 9093
+│   ├── AlertManager - puerto 9093
+│   └── Node Exporter - puerto 9100
 └── PostgreSQL (Docker) - puerto 5432
 
 Internet
@@ -613,7 +956,8 @@ Slack
 | **Database** | PostgreSQL 15 | Data persistence |
 | **Container** | Docker | Reproducible environment |
 | **Orchestration** | Docker Compose | Multi-container management |
-| **Metrics** | prom-client | Instrument code |
+| **App Metrics** | prom-client | Instrument code |
+| **Server Metrics** | Node Exporter | OS-level metrics |
 | **Time Series DB** | Prometheus 2.53.0 | Collect + store metrics |
 | **Visualization** | Grafana 10.4.1 | Dashboards + queries |
 | **Alerting** | AlertManager 0.26.0 | Alert routing |
@@ -653,6 +997,14 @@ Slack
 - Observability best practices
 - Troubleshooting (OOM, permissions, networking)
 
+### Proyecto 4
+- Node Exporter installation + systemd
+- Server-level metrics (CPU, RAM, Disk, Network)
+- Multi-target Prometheus scraping
+- Alerting on infrastructure (not just app)
+- Capacity planning + resource constraints
+- Detecting indirect issues (high latency without errors = BD problem)
+
 ---
 
 ## Portfolio Value
@@ -661,13 +1013,15 @@ Slack
 ✅ End-to-end infrastructure automation
 ✅ Container orchestration
 ✅ Database integration
-✅ Monitoring + observability
-✅ CI/CD pipelines
+✅ App-level monitoring
+✅ Infrastructure-level monitoring
 ✅ Alerting + notifications
+✅ CI/CD pipelines
 ✅ AWS cloud skills
 ✅ Linux/systemd knowledge
 ✅ Troubleshooting real issues (OOM, permissions, networking)
 ✅ Best practices (retention, health checks, redundancy)
+✅ Observability at scale
 
 ---
 
@@ -710,6 +1064,7 @@ curl http://18.189.29.49/
 ```
 Grafana: http://18.189.29.49:3000 (admin/admin)
 Prometheus: http://18.189.29.49:9090
+Node Exporter: http://18.189.29.49:9100/metrics
 ```
 
 ---
@@ -725,7 +1080,7 @@ DevOps learner on a structured 18-month learning plan:
 
 ---
 
-**Last updated**: July 30, 2026
-**Status**: Proyecto 3 (Monitoreo) ✅ Completado
-**Next**: Proyecto 4 (Node Exporter + cAdvisor)
+**Last updated**: Agosto 3, 2026
+**Status**: Proyecto 4 (Node Exporter) ✅ Completado
+**Next**: Proyecto 5 (cAdvisor + Docker Compose completo)
 ```
